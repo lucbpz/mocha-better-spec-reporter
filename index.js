@@ -21,9 +21,86 @@ var SourceMapConsumer = require('source-map').SourceMapConsumer;
 
 var dataUriToBuffer = require('data-uri-to-buffer');
 
+const rules = [
+  {
+    match: /^You are using the simple \(heuristic\) fragment matcher/,
+    group: "Apollo: You are using the simple (heuristic) fragment matcher.",
+  },
+  {
+    match: /^Heuristic fragment matching going on/,
+    group: null, // ignore outright
+  },
+  {
+    match: /^Warning: An update to (\w*) inside a test was not wrapped in act/,
+    group: "React: Act warnings",
+    keep: true, // TODO: implement this. include in summary, but also keep raw console output 
+  },
+  {
+    match: /^Warning: componentWillReceiveProps has been renamed/,
+    group: "React deprecation warning: componentWillReceiveProps",
+  },
+  {
+    match: /^Warning: componentWillMount has been renamed/,
+    group: "React deprecation warning: componentWillMount",
+  },
+  {
+    match: /react-beautiful-dnd/,
+    group: 'React draggable component',
+  },
+  {
+    match: /^Warning: unmountComponentAtNode/,
+    group: 'React unmounted component at node warning'
+  },
+  {
+    match: /^Warning: Can't perform a React state update on an unmounted component/,
+    group: 'React unmounted component: cannot perform a React state update'
+  },
+  {
+    match: /^Warning: Encountered two children with the same key/,
+    group: 'React children: two children with the same key'
+  },
+  {
+    match: /^Warning: Each child in a list should have a unique "key" prop/,
+    group: 'React children: each child must have a unique key',
+  },
+  {
+    match: /^The width(0) and height(0)/,
+    group: 'Recharts: React component with no width and height',
+  }
+];
+
+function getRuleMatched(message) {
+  return rules.find(rule => (new RegExp(rule.match)).test(message));
+}
+
+function addToCount(matchedRule) {
+  if(!matchedRule) return;
+  if (matchedRule.count === undefined) matchedRule.count = 0;
+  matchedRule.count += 1;
+}
+
+function getSeverityAndColor(severity) {
+  switch (severity) {
+    case 'INFO':
+      return {color: 'stat', severity: 'INFO'};
+    case 'WARN':
+      return {color: 'pending', severity: 'WARN'};
+    case 'ERROR':
+      return {color: 'fail', severity: 'ERROR'};
+  }
+}
+
+const addSeverity = (severity) => (matchedRule) => {
+  if (matchedRule && !matchedRule.color) {
+    matchedRule.color = getSeverityAndColor(severity).color;
+    matchedRule.severity = getSeverityAndColor(severity).severity;
+  }
+  return matchedRule;
+}
+
 function parseEnvOptions(opts) {
   var v = process.env.MOCHA_REPORTER_OPTS || '',
-    s = process.env.MOCHA_REPORTER_STACK_EXCLUDE;
+      s = process.env.MOCHA_REPORTER_STACK_EXCLUDE;
 
   if(s) {
     opts.stackExclude = s;
@@ -67,8 +144,11 @@ function Reporter(runner, mochaOptions) {
   var that = this;
 
   this.options = {
-    showSourceMapFiles: true,
-    showFailsInBackOrder: true
+    showSourceMapFiles: false,
+    showFailsInBackOrder: false,
+    mockConsole: true,
+    hideNodeModulesStack: true,
+    hideTestingLibraryDOM: true,
   };
 
   this.options = parseEnvOptions(this.options);
@@ -77,6 +157,53 @@ function Reporter(runner, mochaOptions) {
   if(!this.options.showSourceMapFiles && !this.options.showJavascriptFiles) {
     this.options.showJavascriptFiles = true;
   }
+
+  const consoleInfos = [];
+  const consoleWarns = [];
+  const consoleErrors = [];
+  /* --------------------------- */
+  /* <Mock console> */
+  this.logger = {
+    info: console.log,
+    warn: console.warn,
+    error: console.error,
+  };
+
+  console.log = (message) => {
+    const matchedRule = getRuleMatched(message);
+    addSeverity('INFO')(matchedRule);
+    addToCount(matchedRule);
+    consoleInfos.push(message);
+    if (!this.options.mockConsole) {
+      this.logger.info(message);
+    } else if (matchedRule && matchedRule.keep) {
+      this.logger.info(message);
+    }
+  };
+  console.warn = (message) => {
+    const matchedRule = getRuleMatched(message);
+    addSeverity('WARN')(matchedRule);
+    addToCount(matchedRule);
+    consoleWarns.push(message);
+    if (!this.options.mockConsole) {
+      this.logger.warn(message);
+    } else if (matchedRule && matchedRule.keep) {
+      this.logger.warn(message);
+    }
+  }
+  console.error = (message) => {
+    const matchedRule = getRuleMatched(message);
+    addSeverity('ERROR')(matchedRule);
+    addToCount(matchedRule);
+    consoleErrors.push(message);
+    if (!this.options.mockConsole) {
+      this.logger.error(message);
+    } else if (matchedRule && matchedRule.keep) {
+      this.logger.error(message);
+    }
+  }
+  /* </Mock console> */
+  /* --------------------------- */
 
   var stats = this.stats = {suites: 0, tests: 0, passes: 0, pending: 0, failures: 0, timeouts: 0};
   var failures = this.failures = [];
@@ -139,8 +266,6 @@ function Reporter(runner, mochaOptions) {
   });
 
   runner.on('end', function() {
-    //console.log(runner);
-
     stats.end = new Date;
     stats.duration = stats.end - stats.start;
 
@@ -150,11 +275,12 @@ function Reporter(runner, mochaOptions) {
       that.writeLine();
     }
 
+    if(failures.length) that.writeFailures(failures);
+
     if(!that.options.hideStats) {
       that.writeStat(stats);
+      that.writeSuppressedConsoleMessages(rules, consoleInfos.length + consoleWarns.length + consoleErrors.length);
     }
-
-    if(failures.length) that.writeFailures(failures);
   });
 }
 
@@ -170,9 +296,9 @@ Reporter.prototype.writeTest = function writeTest(test) {
 
   if(!this.options.hideTitles) {
     this.writeLine(
-      '%s %s',
-      color('option ' + state, prefix),
-      color('test title ' + state, test.title + (test.timedOut ? ' (timeout)' : '')));
+        '%s %s',
+        color('option ' + state, prefix),
+        color('test title ' + state, test.title + (test.timedOut ? ' (timeout)' : '')));
   }
 
   this.indentation -= 0.5;
@@ -187,7 +313,8 @@ Reporter.prototype.writeLine = function() {
 };
 
 Reporter.prototype.writeStat = function(stats) {
-  this.indentation++;
+  this.writeLine();
+  this.writeLine('------------------------------------------------------');
   if(stats.suites) {
     this.writeLine(color('stat', 'Executed %d tests in %d suites in %s'), stats.tests, stats.suites, formatTime(stats.duration));
   } else {
@@ -207,11 +334,39 @@ Reporter.prototype.writeStat = function(stats) {
         this.writeLine(color('fail', '%d failed'), stats.failures);
     }
   }
-  this.indentation -= 2;
+  this.indentation--;
 };
+
+Reporter.prototype.writeSuppressedConsoleMessages = function(rules, total) {
+  this.writeLine('------------------------------------------------------');
+  this.writeLine(color('stat', 'Suppressed console messages'));
+  this.indentation++;
+  // this.logger.info(rules)
+  rules.forEach(rule => {
+    if (rule.count) {
+      this.writeLine(color(rule.color, rule.severity), `${rule.group} (${rule.count})`);
+    }
+  });
+  this.writeLine(`TOTAL Messages Suppressed (${total})`)
+  this.indentation--;
+
+}
+
+Reporter.prototype.printErrorMessage = function(message) {
+  if (this.options.hideTestingLibraryDOM && message.includes('Unable to find an element')) {
+    this.writeLine(color('error message', '%s'), message.split('\n')[0]);
+  } else {
+    message.split('\n').forEach(function(messageLine) {
+      this.writeLine(color('error message', '%s'), messageLine);
+    }, this);
+  }
+
+}
 
 
 Reporter.prototype.writeFailures = function(failures) {
+  this.writeLine('------------------------------------------------------');
+  this.writeLine(color('stat', 'Failed tests'));
   this.indentation++;
 
   if(this.options.showFailsInBackOrder)
@@ -219,11 +374,11 @@ Reporter.prototype.writeFailures = function(failures) {
 
   failures.forEach(function(test, i) {
     var err = test.err,
-      message = err.message,
-      stack = err.stack,
-      actual = err.actual,
-      expected = err.expected,
-      escape = true;
+        message = err.message,
+        stack = err.stack,
+        actual = err.actual,
+        expected = err.expected,
+        escape = true;
 
     if(this.options.showFailsInBackOrder)
       i = failures.length - 1 - i;
@@ -236,13 +391,13 @@ Reporter.prototype.writeFailures = function(failures) {
     });
 
     this.writeLine();
-    this.writeLine(color('error title', '%d) %s'), i + 1, test.fullTitle());
+    this.writeLine(color('fail', '%d) %s'), i + 1, test.titlePath().join(' > '));
     this.writeLine();
 
     this.indentation++;
-    message.split('\n').forEach(function(messageLine) {
-      this.writeLine(color('error message', '%s'), messageLine);
-    }, this);
+    this.printErrorMessage(message);
+    // this.indentation--;
+
 
     if(!test.timedOut) {
       var typeA = typeof actual;
@@ -274,15 +429,17 @@ Reporter.prototype.writeFailures = function(failures) {
             lineNumber = parsedStack[i].getLineNumber(),
             columnNumber = parsedStack[i].getColumnNumber();
 
-          if(~this.files.indexOf(fileName)) {
-            isTestFiles = true;
-            isFilesBeforeTests = false;
-          } else {
-            isTestFiles = false;
-          }
+          if (this.options.hideNodeModulesStack && !fileName.includes('node_modules')) {
+            if(~this.files.indexOf(fileName)) {
+              isTestFiles = true;
+              isFilesBeforeTests = false;
+            } else {
+              isTestFiles = false;
+            }
 
-          if((isTestFiles || isFilesBeforeTests) && (!this.options.stackExclude || !minimatch(fileName, this.options.stackExclude))) {
-            this.writeStackLine(line, fileName, lineNumber, columnNumber);
+            if((isTestFiles || isFilesBeforeTests) && (!this.options.stackExclude || !minimatch(fileName, this.options.stackExclude))) {
+              this.writeStackLine(line, fileName, lineNumber, columnNumber);
+            }
           }
         }, this);
     }
@@ -390,15 +547,15 @@ Reporter.prototype.writeFilePosition = function(lines, filePos) {
   var linenums = Object.keys(lines).map(function(l) { return parseInt(l, 10); });
 
   var longestLength = linenums
-    .filter(function(n) {
-      return !!lines[n]
-    })
-    .map(function(n) {
-      return ('' + (n + 1)).length;
-    })
-    .reduce(function(acc, n) {
-      return Math.max(acc, n)
-    });// O_O Omg
+      .filter(function(n) {
+        return !!lines[n]
+      })
+      .map(function(n) {
+        return ('' + (n + 1)).length;
+      })
+      .reduce(function(acc, n) {
+        return Math.max(acc, n)
+      });// O_O Omg
 
   linenums.forEach(function(ln) {
     var line = lines[ln];
@@ -450,9 +607,9 @@ function sameType(a, b) {
 
 function escapeInvisibles(line) {
   return line
-    .replace(/\t/g, '<TAB>')
-    .replace(/\r/g, '<CR>')
-    .replace(/\n/g, '<LF>\n');
+      .replace(/\t/g, '<TAB>')
+      .replace(/\r/g, '<CR>')
+      .replace(/\n/g, '<LF>\n');
 }
 
 
